@@ -1,0 +1,6 @@
+pandas==2.2.3
+numpy==2.2.5
+scikit-learn==1.6.1
+xgboost==3.0.0
+sdv==1.20.1
+matplotlib==3.10.1
