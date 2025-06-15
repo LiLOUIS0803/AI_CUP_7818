@@ -1,6 +1,7 @@
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import precision_score, roc_auc_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import StratifiedKFold
@@ -48,7 +49,29 @@ def compute_multiclass_auc(y_true, y_score):
     y_true_onehot = pd.get_dummies(y_true)
     return roc_auc_score(y_true_onehot, y_score, average='micro')
 
-# 讀取資料
+
+def train_model(params, skf, models, X, y, X_val):
+    aucs = []
+    fold_aucs = []
+    times = 1
+    for train_idx, _ in skf.split(X, y):
+        print("fold:", times)
+        dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx])
+        dval_cv = xgb.DMatrix(X_val)
+
+        bst = xgb.train(params, dtrain, num_boost_round=100)
+        preds = bst.predict(dval_cv)
+        if num_class == 2:
+            auc = roc_auc_score(y_val[task], preds)
+        else:
+            auc = compute_multiclass_auc(y_val[task], preds)
+        print("auc:", auc)
+        fold_aucs.append(auc)
+
+        fold_preds = preds
+        models[task] = bst  # 最後一輪的模型可作為 test 使用
+        times += 1
+    return aucs, fold_aucs, fold_preds, models
 
 
 df_train = pd.read_csv("data/processed/GAN_gender_train.csv")
@@ -63,10 +86,12 @@ X_val_2, y_val_2 = load_data(
 N_SPLITS = 7
 skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
 
-# 訓練模型與預測
-models = {}
 
+models = {}
 scores = {}
+
+models_all = {}
+scores_all = {}
 
 for task in TASKS.keys():
     print(task)
@@ -85,10 +110,7 @@ for task in TASKS.keys():
         'alpha': 0.0,
         'scale_pos_weight': 1.5
     }
-    X_train = None
-    y_train = None
-    X_val = None
-    y_val = None
+
     if task == "gender":
         X_train = X_train_1
         y_train = y_train_1
@@ -99,41 +121,60 @@ for task in TASKS.keys():
         y_train = y_train_2
         X_val = X_val_2
         y_val = y_val_2
+
+    X_train_all = X_train
+    X_val_all = X_val
+
     X_train = X_train[TASK_FEATURES[task]]
     X_val = X_val[TASK_FEATURES[task]]
+
     X = X_train.values
+    X_all = X_train_all.values
     y = y_train[task].values
 
-    fold_preds = np.zeros(
-        (X_val.shape[0], num_class)) if num_class > 2 else np.zeros(X_val.shape[0])
-    aucs = []
-    fold_aucs = []
-    times = 1
-    for train_idx, _ in skf.split(X, y):
-        print("fold:", times)
-        dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx])
-        dval_cv = xgb.DMatrix(X_val)
+    aucs, fold_aucs, fold_preds, models = train_model(
+        params, skf, models, X, y, X_val)
+    aucs_all, fold_aucs_all, fold_preds_all, models_all = train_model(
+        params, skf, models_all, X_all, y, X_val_all)
 
-        bst = xgb.train(params, dtrain, num_boost_round=100)
-        preds = bst.predict(dval_cv)
-        if num_class == 2:
-            auc = roc_auc_score(y_val[task], preds)
-        else:
-            auc = compute_multiclass_auc(y_val[task], preds)
-        print("auc:", auc)
-        fold_aucs.append(auc)
-
-        fold_preds += preds / N_SPLITS
-        models[task] = bst  # 最後一輪的模型可作為 test 使用
-        times += 1
     if fold_preds.ndim == 1 or fold_preds.shape[1] == 1:
         auc = roc_auc_score(y_val[task], fold_preds)
+        auc_all = roc_auc_score(y_val[task], fold_preds_all)
     else:
         auc = compute_multiclass_auc(y_val[task], fold_preds)
+        auc_all = compute_multiclass_auc(y_val[task], fold_preds_all
+                                         )
     scores[task] = {
         "final_auc": auc,
         "fold_aucs": fold_aucs
     }
+    scores_all[task] = {
+        "final_auc": auc_all,
+        "fold_aucs": fold_aucs_all
+    }
+
+    # N 計算與繪製混淆矩陣
+    if num_class == 2:
+        y_pred_label = (fold_preds > 0.5).astype(int)
+        y_pred_label_all = (fold_preds_all > 0.5).astype(int)
+
+    else:
+        y_pred_label = np.argmax(fold_preds, axis=1)
+        y_pred_label_all = np.argmax(fold_preds_all, axis=1)
+
+    cm = confusion_matrix(y_val[task], y_pred_label)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(cmap=plt.cm.Blues, values_format='d')
+    plt.title(f"{task} 混淆矩陣_特徵選取")
+    plt.savefig(f'output/{task}_confusion_matrix.png')
+    plt.close()
+
+    cm = confusion_matrix(y_val[task], y_pred_label_all)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot(cmap=plt.cm.Blues, values_format='d')
+    plt.title(f"{task} 混淆矩陣")
+    plt.savefig(f'output/{task}_all_confusion_matrix.png')
+    plt.close()
 
 
 # 最終平均分數
@@ -142,15 +183,64 @@ final_score = sum([v["final_auc"] for v in scores.values()]) / len(scores)
 print("各任務 ROC AUC:", scores)
 print("總平均分數:", final_score)
 
+# N 圖像化: 各任務總 AUC
+tasks = list(scores.keys())
+
+auc_values = [scores[t]["final_auc"] for t in tasks]
+auc_all_values = [scores_all[t]["final_auc"] for t in tasks]
+
+final_score_all = sum(auc_all_values) / len(auc_all_values)
+
+auc_values.append(final_score)
+auc_all_values.append(final_score_all)
+
+plt.figure(figsize=(10, 6))
+x = np.arange(len(tasks) + 1)
+width = 0.35
+
+bars1 = plt.bar(x - width/2, auc_values, width, label='特徵選取')
+bars2 = plt.bar(x + width/2, auc_all_values, width, label='無特徵選取')
+
+plt.xticks(x, tasks + ['平均 AUC'])
+plt.ylim(0, 1)
+plt.ylabel("AUC")
+plt.title("各任務最終 AUC 分數比較")
+plt.legend()
+
+for bar in bars1:
+    plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+             f"{bar.get_height():.4f}", ha='center')
+for bar in bars2:
+    plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+             f"{bar.get_height():.4f}", ha='center')
+
+plt.savefig('output/task_final_compare.png')
+plt.close()
+
+# N 繪製每個任務的 cross-validation AUC 分佈比較
+for task in tasks:
+    fold_aucs = scores[task]["fold_aucs"]
+    fold_aucs_all = scores_all[task]["fold_aucs"]
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(range(1, len(fold_aucs)+1), fold_aucs, marker='o', label='特徵選取')
+    plt.plot(range(1, len(fold_aucs_all)+1),
+             fold_aucs_all, marker='s', label='無特徵選取')
+    plt.ylim(0, 1)
+    plt.title(f"{task} 每個 Fold 的 AUC 比較")
+    plt.xlabel("Fold")
+    plt.ylabel("AUC")
+    plt.legend()
+    plt.savefig(f'output/{task}_auc_compare.png')
+    plt.close()
 
 df_test = pd.read_csv("data/processed/test_features.csv")
 X_test = load_data(df_test, test=True)
-
 output = pd.DataFrame()
 output['unique_id'] = df_test['unique_id']
 
 for task in TASKS.keys():
-    if task is not "gender":
+    if task != "gender":
         X_test["gender"] = np.where(output["gender"] > 0.5, 1, 0)
     X_test_ = X_test
     X_test_ = X_test[TASK_FEATURES[task]]
@@ -168,43 +258,3 @@ for task in TASKS.keys():
 
 output.to_csv("result/xgboost_submission.csv",
               index=False, float_format='%.10f')
-
-
-df_test = pd.read_csv("data/processed/train_features.csv")
-X_test = load_data(df_test, test=True)
-
-
-# N 圖像化: 各任務總 AUC
-tasks = list(scores.keys())
-auc_values = [scores[t]["final_auc"] for t in tasks]
-
-plt.figure(figsize=(8, 6))
-bars = plt.bar(tasks, auc_values)
-plt.ylim(0, 1)
-plt.ylabel("AUC")
-plt.title("各任務最終 AUC 分數")
-for bar, auc in zip(bars, auc_values):
-    plt.text(bar.get_x() + bar.get_width() / 2,
-             bar.get_height() + 0.01, f"{auc:.4f}", ha='center')
-plt.savefig('output/task_final.png')
-
-# N 繪製總平均 AUC
-plt.figure(figsize=(4, 4))
-plt.bar(['平均 AUC'], [final_score])
-plt.ylim(0, 1)
-plt.text(0, final_score + 0.01, f"{final_score:.4f}", ha='center')
-plt.title("總平均 AUC 分數")
-plt.savefig('output/avg.png')
-
-# N 繪製每個任務的 cross-validation AUC 分佈
-for task in tasks:
-    fold_aucs = scores[task]["fold_aucs"]
-    plt.figure(figsize=(6, 4))
-    plt.plot(range(1, len(fold_aucs)+1), fold_aucs, marker='o')
-    plt.ylim(0, 1)
-    plt.title(f"{task} 每個 Fold 的 AUC")
-    plt.xlabel("Fold")
-    plt.ylabel("AUC")
-    for i, auc in enumerate(fold_aucs):
-        plt.text(i+1, auc + 0.01, f"{auc:.4f}", ha='center')
-    plt.savefig(f'output/{task}_auc.png')
